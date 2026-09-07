@@ -1,0 +1,274 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Sistema Operativo VR Box - Mouse Aéreo & Passthrough</title>
+  
+  <style>
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+      overflow: hidden;
+    }
+    body, html {
+      width: 100%;
+      height: 100%;
+      background-color: #000;
+      font-family: Arial, sans-serif;
+    }
+    /* Ocultar elementos de captura de video/canvas de procesamiento */
+    #video-input, #output-canvas {
+      display: none;
+    }
+    /* Canvas 3D dividido para VR Box */
+    #vr-canvas {
+      width: 100vw;
+      height: 100vh;
+      display: block;
+    }
+    /* Capa de estado / Mensajes de diagnóstico */
+    #status-overlay {
+      position: absolute;
+      top: 10px;
+      left: 50%;
+      transform: translateX(-50%);
+      color: #00ffcc;
+      font-size: 14px;
+      font-weight: bold;
+      background: rgba(0, 0, 0, 0.7);
+      padding: 8px 16px;
+      border-radius: 20px;
+      z-index: 10;
+      pointer-events: none;
+    }
+  </style>
+
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
+</head>
+<body>
+
+  <div id="status-overlay">Iniciando cámara y sistema de seguimiento...</div>
+  
+  <video id="video-input" playsinline></video>
+  <canvas id="output-canvas"></canvas>
+  
+  <canvas id="vr-canvas"></canvas>
+
+  <script>
+    // --- CONFIGURACIÓN DE PARÁMETROS Y ESTADOS ---
+    const PINCH_THRESHOLD = 0.05; // Distancia entre índice y pulgar para activar Clic/Pizco
+    let isPinching = false;
+    let pinchedObject = null;
+    let pinchOffset = new THREE.Vector3();
+
+    const statusOverlay = document.getElementById('status-overlay');
+    const videoElement = document.getElementById('video-input');
+    const vrCanvas = document.getElementById('vr-canvas');
+
+    // --- 1. CONFIGURACIÓN DEL ENTORNO 3D (THREE.JS) ---
+    const scene = new THREE.Scene();
+    
+    // Configuración Estereoscópica (Dos cámaras para visor VR Box)
+    const aspect = (window.innerWidth / 2) / window.innerHeight;
+    const cameraLeft = new THREE.PerspectiveCamera(60, aspect, 0.1, 1000);
+    const cameraRight = new THREE.PerspectiveCamera(60, aspect, 0.1, 1000);
+    
+    // Distancia interpupilar (IPD) aproximada en metros
+    const IPD = 0.064; 
+    cameraLeft.position.set(-IPD / 2, 0, 0);
+    cameraRight.position.set(IPD / 2, 0, 0);
+
+    const renderer = new THREE.WebGLRenderer({ canvas: vrCanvas, antialias: true, alpha: true });
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.setPixelRatio(window.devicePixelRatio);
+
+    // --- 2. FONDO DE CÁMARA EN TIEMPO REAL (PASSTHROUGH) ---
+    const videoTexture = new THREE.VideoTexture(videoElement);
+    videoTexture.minFilter = THREE.LinearFilter;
+    videoTexture.magFilter = THREE.LinearFilter;
+    videoTexture.format = THREE.RGBAFormat;
+
+    // Plano 3D gigante al fondo que proyecta la cámara trasera
+    const bgGeometry = new THREE.PlaneGeometry(16, 9);
+    const bgMaterial = new THREE.MeshBasicMaterial({ map: videoTexture, depthWrite: false });
+    const backgroundPlane = new THREE.Mesh(bgGeometry, bgMaterial);
+    backgroundPlane.position.z = -5;
+    scene.add(backgroundPlane);
+
+    // --- 3. CREACIÓN DE VENTANAS FLOTANTES (UI MULTITAREA) ---
+    const windowGroup = new THREE.Group();
+    scene.add(windowGroup);
+
+    function createWindow(title, color, xPos) {
+      const group = new THREE.Group();
+      
+      // Marco de la Ventana
+      const frameGeo = new THREE.PlaneGeometry(1.2, 1.6);
+      const frameMat = new THREE.MeshBasicMaterial({ color: 0x1e1e1e, side: THREE.DoubleSide });
+      const frame = new THREE.Mesh(frameGeo, frameMat);
+      group.add(frame);
+
+      // Barra superior de arrastre (Header)
+      const headerGeo = new THREE.PlaneGeometry(1.2, 0.2);
+      const headerMat = new THREE.MeshBasicMaterial({ color: 0x333333 });
+      const header = new THREE.Mesh(headerGeo, headerMat);
+      header.position.y = 0.7;
+      header.userData = { isHeader: true, parentWindow: group };
+      group.add(header);
+
+      // Pantalla de Contenido
+      const contentGeo = new THREE.PlaneGeometry(1.1, 1.3);
+      const contentMat = new THREE.MeshBasicMaterial({ color: color });
+      const content = new THREE.Mesh(contentGeo, contentMat);
+      content.position.y = -0.1;
+      group.add(content);
+
+      group.position.set(xPos, 0, -2);
+      windowGroup.add(group);
+      return group;
+    }
+
+    // Ventanas simuladas (ej: TikTok, YouTube, Google)
+    const winTikTok = createWindow("TikTok", 0xfe2c55, -0.7);
+    const winYouTube = createWindow("YouTube", 0xff0000, 0.7);
+
+    // --- 4. PUNTERO DEL MOUSE AÉREO ---
+    const cursorGeo = new THREE.SphereGeometry(0.02, 16, 16);
+    const cursorMat = new THREE.MeshBasicMaterial({ color: 0x00ffcc });
+    const airCursor = new THREE.Mesh(cursorGeo, cursorMat);
+    scene.add(airCursor);
+
+    // --- 5. LÓGICA DE MEDIAPIPE (HAND TRACKING) ---
+    const hands = new Hands({
+      locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`
+    });
+
+    hands.setOptions({
+      maxNumHands: 1,
+      modelComplexity: 1,
+      minDetectionConfidence: 0.7,
+      minTrackingConfidence: 0.7
+    });
+
+    hands.onResults(onHandResults);
+
+    function onHandResults(results) {
+      if (results.multiHandLandmarks && results.multiHandLandmarks.length > 0) {
+        statusOverlay.innerText = "Mano detectada: Mouse Aéreo Activo";
+        const landmarks = results.multiHandLandmarks[0];
+
+        // Landmark #8 = Punta del Índice, Landmark #4 = Punta del Pulgar
+        const indexTip = landmarks[8];
+        const thumbTip = landmarks[4];
+
+        // Convertir coordenadas 2D de la cámara a coordenadas 3D de Three.js
+        const cursorX = (1 - indexTip.x - 0.5) * 3;
+        const cursorY = (0.5 - indexTip.y) * 2;
+        airCursor.position.set(cursorX, cursorY, -1.8);
+
+        // Calcular distancia entre Índice y Pulgar (Pizco)
+        const distance = Math.hypot(
+          indexTip.x - thumbTip.x,
+          indexTip.y - thumbTip.y,
+          indexTip.z - thumbTip.z
+        );
+
+        if (distance < PINCH_THRESHOLD) {
+          if (!isPinching) {
+            isPinching = true;
+            airCursor.material.color.setHex(0xff0000); // Rojo cuando hace clic/pizco
+            processPinchStart(cursorX, cursorY);
+          } else {
+            processPinchMove(cursorX, cursorY);
+          }
+        } else {
+          if (isPinching) {
+            isPinching = false;
+            airCursor.material.color.setHex(0x00ffcc); // Verde agua cuando suelta
+            pinchedObject = null;
+          }
+        }
+      } else {
+        statusOverlay.innerText = "Buscando mano frente a la cámara...";
+      }
+    }
+
+    // --- 6. INTERACCIÓN Y MANEJO DE VENTANAS (PINCH & DRAG) ---
+    const raycaster = new THREE.Raycaster();
+
+    function processPinchStart(x, y) {
+      raycaster.set(cameraLeft.position, new THREE.Vector3(x, y, -1.8).sub(cameraLeft.position).normalize());
+      
+      const intersects = raycaster.intersectObjects(scene.children, true);
+      for (let i = 0; i < intersects.length; i++) {
+        const obj = intersects[i].object;
+        if (obj.userData && obj.userData.isHeader) {
+          pinchedObject = obj.userData.parentWindow;
+          pinchOffset.copy(pinchedObject.position).sub(new THREE.Vector3(x, y, -2));
+          break;
+        }
+      }
+    }
+
+    function processPinchMove(x, y) {
+      if (pinchedObject) {
+        pinchedObject.position.x = x + pinchOffset.x;
+        pinchedObject.position.y = y + pinchOffset.y;
+      }
+    }
+
+    // --- 7. INICIALIZACIÓN DE CÁMARA TRASERA & BUCLE DE RENDERIZADO ---
+    const cameraUtils = new Camera(videoElement, {
+      onFrame: async () => {
+        await hands.send({ image: videoElement });
+      },
+      facingMode: 'environment', // Fuerza el uso de la cámara trasera
+      width: 1280,
+      height: 720
+    });
+
+    cameraUtils.start().catch(err => {
+      statusOverlay.innerText = "Error accediendo a la cámara trasera: " + err.message;
+    });
+
+    // Renderizado en pantalla dividida (Side-by-Side para VR Box)
+    function animate() {
+      requestAnimationFrame(animate);
+
+      const width = window.innerWidth;
+      const height = window.innerHeight;
+
+      renderer.setScissorTest(true);
+
+      // Ojo Izquierdo
+      renderer.setScissor(0, 0, width / 2, height);
+      renderer.setViewport(0, 0, width / 2, height);
+      renderer.render(scene, cameraLeft);
+
+      // Ojo Derecho
+      renderer.setScissor(width / 2, 0, width / 2, height);
+      renderer.setViewport(width / 2, 0, width / 2, height);
+      renderer.render(scene, cameraRight);
+
+      renderer.setScissorTest(false);
+    }
+
+    animate();
+
+    // Redimensionar automáticamente si se gira la pantalla
+    window.addEventListener('resize', () => {
+      const w = window.innerWidth;
+      const h = window.innerHeight;
+      renderer.setSize(w, h);
+      cameraLeft.aspect = (w / 2) / h;
+      cameraLeft.updateProjectionMatrix();
+      cameraRight.aspect = (w / 2) / h;
+      cameraRight.updateProjectionMatrix();
+    });
+  </script>
+</body>
+</html>
